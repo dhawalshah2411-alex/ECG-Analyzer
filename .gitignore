@@ -1,0 +1,22 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Compiled Python bytecode
+__pycache__/
+*.py[cod]
+
+# Testing artifacts
+.pytest_cache/
+.coverage
+
+# Editor settings
+.vscode/
+
+# Windows clutter
+Thumbs.db
+desktop.ini
+
+# Recorded ECG data and databases
+recordings/
+*.db
