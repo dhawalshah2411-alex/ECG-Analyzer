@@ -20,3 +20,7 @@ desktop.ini
 # Recorded ECG data and databases
 recordings/
 *.db
+
+# Local hardware bring-up scripts (not part of the application)
+serial_test.py
+timing_test.py
