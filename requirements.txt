@@ -1,17 +1,17 @@
 # GUI framework (Qt bindings for Python)
-PySide6
+PySide6==6.11.1
 
 # Real-time plotting, built on Qt
-pyqtgraph
+pyqtgraph==0.14.0
 
 # Numerical arrays — the base for all signal processing
-numpy
+numpy==2.5.2
 
 # Signal processing: filters, peak detection
-scipy
+scipy==1.18.0
 
 # Serial communication with the Arduino
-pyserial
+pyserial==3.5
 
 # Automated testing
-pytest
+pytest==9.1.1
