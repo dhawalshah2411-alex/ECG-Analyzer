@@ -28,9 +28,14 @@ class DataBuffer:
         """Return the buffered samples as a NumPy array."""
         return np.array(self._samples, dtype=float)
 
-    def get_time_axis(self):
-        """Return matching timestamps in seconds, ending at 0.0 (now)."""
-        n = len(self._samples)
+    def get_time_axis(self, n=None):
+        """Return timestamps in seconds, ending at 0.0 (now).
+
+        Pass n to match an array you already took, avoiding a mismatch
+        if the buffer grew in between.
+        """
+        if n is None:
+            n = len(self._samples)
         return np.linspace(-n / self.sample_rate, 0.0, n)
 
     def is_full(self):
