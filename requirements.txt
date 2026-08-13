@@ -15,3 +15,6 @@ pyserial==3.5
 
 # Automated testing
 pytest==9.1.1
+
+# PhysioNet waveform database reader (for reference datasets)
+wfdb==4.3.1
