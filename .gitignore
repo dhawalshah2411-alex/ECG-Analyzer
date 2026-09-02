@@ -24,3 +24,15 @@ recordings/
 # Local hardware bring-up scripts (not part of the application)
 serial_test.py
 timing_test.py
+
+# Local development scripts (not part of the application)
+download_sample.py
+test_acquisition.py
+test_buffer.py
+test_detect.py
+test_diagnose.py
+test_filters.py
+test_hr.py
+test_record.py
+test_thread.py
+test_window.py
