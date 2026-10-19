@@ -20,7 +20,8 @@ WINDOW_SECONDS = 4.0          # width of the ECG view
 TREND_SECONDS = 60            # width of the heart-rate trend
 DRAW_INTERVAL_MS = 33         # redraw about 30 times a second
 ANALYSIS_INTERVAL_MS = 500    # full analysis twice a second
-SETTLE_SECONDS = 10           # signal shown but not saved before recording
+SETTLE_SECONDS = 15           # signal shown but not saved before recording;
+                              # quality needs 10 s, so this leaves 5 s to act
 FILTER_NOTE = "bandpass 0.5-40 Hz, notch 50 Hz (display only; saved signal is raw)"
 
 
@@ -232,6 +233,7 @@ class MainWindow(QMainWindow):
         self._result = None
         for card in (self.hr_card, self.rr_card, self.sdnn_card):
             card.set_value(None)
+        self.quality_card.set_state("unknown")
         empty = np.array([])
         self.ecg_plot.set_data(empty, empty, empty)
         self.ecg_plot.set_markers(empty, empty)
@@ -296,6 +298,9 @@ class MainWindow(QMainWindow):
         self.rr_card.set_value(self._result.rr_ms)
         sdnn = self._result.sdnn_ms if self._buffer.is_full() else None
         self.sdnn_card.set_value(sdnn)
+
+        quality = self._result.quality
+        self.quality_card.set_state(quality.state, quality.reason)
 
     # --- session flow -------------------------------------------------
 

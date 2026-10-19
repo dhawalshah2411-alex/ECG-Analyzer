@@ -2,6 +2,10 @@
 
 Contains no GUI code. The same pipeline serves replay and live
 acquisition, and can be tested without opening a window.
+
+Pan-Tompkins produces every displayed number. A second, independent
+detector runs alongside it purely to measure agreement (bSQI), which
+becomes the signal-quality rating.
 """
 
 from dataclasses import dataclass
@@ -9,8 +13,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from app.analysis.heart_rate import HeartRateMonitor
-from app.analysis.r_peaks import pan_tompkins_detect
+from app.analysis.r_peaks import pan_tompkins_detect, simple_detect
 from app.signal_processing.filters import MAINS_HZ, preprocess
+from app.signal_processing.signal_quality import Quality, assess
 
 MIN_SECONDS = 3.0        # below this, too little signal to analyse
 
@@ -25,10 +30,11 @@ class AnalysisResult:
     trend_samples: np.ndarray
     trend_bpm: np.ndarray
     duration_s: float
+    quality: Quality
 
 
 class AnalysisPipeline:
-    """Runs filtering, beat detection and rate calculation on a window."""
+    """Runs filtering, beat detection, rates and quality on a window."""
 
     def __init__(self, sample_rate, mains_hz=MAINS_HZ):
         self.fs = float(sample_rate)
@@ -50,24 +56,27 @@ class AnalysisPipeline:
 
         empty = np.array([], dtype=int)
         if n < MIN_SECONDS * self.fs:
-            return AnalysisResult(empty, None, None, None,
-                                  empty, np.array([]), n / self.fs)
+            return AnalysisResult(empty, None, None, None, empty, np.array([]),
+                                  n / self.fs, Quality("unknown", "", None))
 
         filtered = preprocess(raw, self.fs, mains=self.mains_hz)
         peaks = pan_tompkins_detect(filtered, self.fs)
+        check = simple_detect(filtered, self.fs)     # second opinion, for bSQI
 
+        bpm = self.hr.current_bpm(peaks)
         rr = self.hr.rr_intervals(peaks)
         sdnn = float(np.std(rr) * 1000.0) if len(rr) >= self.hr.window else None
         trend_idx, trend_bpm = self._trend(peaks)
 
         return AnalysisResult(
             peak_samples=peaks + offset,
-            bpm=self.hr.current_bpm(peaks),
+            bpm=bpm,
             rr_ms=self.hr.current_rr(peaks),
             sdnn_ms=sdnn,
             trend_samples=trend_idx + offset,
             trend_bpm=trend_bpm,
             duration_s=n / self.fs,
+            quality=assess(raw, self.fs, peaks, check, bpm),
         )
 
     def _trend(self, peaks):
