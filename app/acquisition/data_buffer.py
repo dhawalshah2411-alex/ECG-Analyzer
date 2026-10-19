@@ -1,7 +1,9 @@
-"""Fixed-size rolling buffer for ECG samples.
+"""Fixed-size rolling buffer for ECG samples, with optional capture.
 
 Holds the most recent N seconds of data. Older samples are discarded
-automatically, so memory use stays constant however long acquisition runs.
+automatically, so memory use stays constant however long acquisition
+runs. During a recording, every new sample is also kept in a separate
+capture list, which is handed over when the recording stops.
 """
 
 from collections import deque
@@ -18,11 +20,15 @@ class DataBuffer:
         self.maxlen = int(sample_rate * window_seconds)
         self._samples = deque(maxlen=self.maxlen)
         self.total_added = 0
+        self._capture = None          # a list while recording, else None
 
     def add(self, value):
         """Add one sample. Oldest is dropped once the window is full."""
         self._samples.append(value)
         self.total_added += 1
+        capture = self._capture       # read once: it may change mid-call
+        if capture is not None:
+            capture.append(value)
 
     def get_values(self):
         """Return the buffered samples as a NumPy array."""
@@ -48,3 +54,24 @@ class DataBuffer:
 
     def __len__(self):
         return len(self._samples)
+
+    # --- recording capture ---------------------------------------------
+
+    def start_capture(self):
+        """Begin keeping every new sample, beyond the rolling window."""
+        self._capture = []
+
+    def stop_capture(self):
+        """Stop keeping samples and return everything captured."""
+        captured, self._capture = self._capture, None
+        return np.array(captured if captured is not None else [], dtype=float)
+
+    @property
+    def is_capturing(self):
+        return self._capture is not None
+
+    @property
+    def captured_count(self):
+        """Number of samples captured so far in the current recording."""
+        capture = self._capture
+        return len(capture) if capture is not None else 0

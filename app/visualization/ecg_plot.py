@@ -1,9 +1,8 @@
 """ECG waveform display with a clinical-standard grid.
 
-Renders at conventional ECG paper proportions: minor gridlines every
-0.04 s / 0.1 mV, major gridlines every 0.2 s / 0.5 mV.
-
-Supports three view modes: raw, filtered, and overlay.
+Gridlines follow ECG paper proportions: minor every 0.04 s / 0.1 mV,
+major every 0.2 s / 0.5 mV. Supports raw, filtered and overlay views,
+markers on detected beats, and a caption stating the scale.
 """
 
 import numpy as np
@@ -20,8 +19,12 @@ MINOR_LINE = QColor(252, 234, 230)
 MAJOR_LINE = QColor(242, 190, 180)
 TRACE = QColor(15, 15, 15)
 RAW_TRACE = QColor(150, 165, 190)
+MARKER = QColor(163, 45, 45)
+CAPTION = QColor(114, 36, 62)
 
 MODES = ("raw", "filtered", "overlay")
+DEFAULT_CAPTION = "Small square = 0.04 s × 0.1 mV"
+MARKER_OFFSET_MV = 0.18     # how far above the peak the marker sits
 
 
 class ECGPlot(pg.PlotWidget):
@@ -40,6 +43,7 @@ class ECGPlot(pg.PlotWidget):
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=False, y=False)
         self.hideButtons()
+        self.getPlotItem().layout.setContentsMargins(4, 12, 12, 4)
 
         self.setXRange(-window_seconds, 0.0, padding=0)
         self.setYRange(mv_range[0], mv_range[1], padding=0)
@@ -53,6 +57,16 @@ class ECGPlot(pg.PlotWidget):
         self.raw_curve.setZValue(1)
         self.curve = self.plot(pen=pg.mkPen(TRACE, width=1.4))
         self.curve.setZValue(2)
+
+        self.markers = pg.ScatterPlotItem(symbol="t", size=10, pen=None,
+                                          brush=pg.mkBrush(MARKER))
+        self.markers.setZValue(3)
+        self.addItem(self.markers)
+
+        self.caption = pg.TextItem(DEFAULT_CAPTION, color=CAPTION, anchor=(0, 0))
+        self.caption.setPos(-window_seconds, mv_range[1])
+        self.caption.setZValue(4)
+        self.addItem(self.caption)
 
         self.set_mode(mode)
 
@@ -104,3 +118,13 @@ class ECGPlot(pg.PlotWidget):
 
         if self._mode == "overlay" and raw is not None:
             self.raw_curve.setData(times, raw)
+
+    def set_markers(self, times, peak_values):
+        """Place a marker above each detected beat."""
+        times = np.asarray(times, dtype=float)
+        peak_values = np.asarray(peak_values, dtype=float)
+        self.markers.setData(times, peak_values + MARKER_OFFSET_MV)
+
+    def set_caption(self, text):
+        """Change the scale caption, e.g. when units are uncalibrated."""
+        self.caption.setText(text)
