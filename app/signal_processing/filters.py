@@ -1,8 +1,17 @@
 """Digital filters for ECG signal conditioning.
 
-All filters use zero-phase forward-backward application, so peak
-positions are preserved exactly. This matters because RR intervals
-and therefore heart rate depend on peak timing.
+Two kinds, for two jobs:
+
+- bandpass / notch / preprocess: zero-phase (forward then backward).
+  Peak positions are preserved exactly, which matters because RR
+  intervals and heart rate depend on peak timing. Used for all
+  analysis. Because each point needs samples from both sides, the
+  newest edge of a live signal comes out distorted.
+
+- StreamingFilter: forward only, one chunk at a time, for the live
+  display. No edge distortion, at the cost of a few milliseconds of
+  delay and slight reshaping of slow waves — the same trade-off bedside
+  monitors make in their "monitor mode".
 """
 
 import numpy as np
@@ -58,3 +67,46 @@ def notch(x, fs, freq=MAINS_HZ, q=NOTCH_Q):
 def preprocess(x, fs, mains=MAINS_HZ):
     """Standard ECG conditioning: band-pass then notch."""
     return notch(bandpass(x, fs), fs, freq=mains)
+
+
+class StreamingFilter:
+    """Band-pass and notch for a live display, applied chunk by chunk.
+
+    Remembers its internal state between calls, so a signal fed in
+    pieces comes out exactly as if it had been filtered in one go —
+    and every new piece can be shown at once, without waiting for
+    future samples.
+
+    For display only. Analysis must keep using preprocess(), whose
+    zero-phase filtering preserves peak timing.
+    """
+
+    def __init__(self, fs, mains=MAINS_HZ, low=HIGHPASS_HZ, high=LOWPASS_HZ,
+                 order=ORDER):
+        nyquist = fs / 2.0
+        high = min(high, nyquist * 0.95)
+        sos = sig.butter(order, [low / nyquist, high / nyquist],
+                         btype="bandpass", output="sos")
+        if mains < nyquist:
+            b, a = sig.iirnotch(mains, NOTCH_Q, fs)
+            sos = np.vstack([sos, sig.tf2sos(b, a)])
+        self._sos = sos
+        self._unit_state = sig.sosfilt_zi(sos)
+        self._state = None
+
+    def reset(self):
+        """Forget the past, e.g. when a new session starts."""
+        self._state = None
+
+    def process(self, chunk):
+        """Filter the next chunk of samples and return it."""
+        chunk = np.asarray(chunk, dtype=float)
+        if len(chunk) == 0:
+            return chunk
+        if self._state is None:
+            # Start as if the first value had always been there, so the
+            # large constant offset of raw ADC counts (about 8,000)
+            # doesn't produce a big swing on the first frames.
+            self._state = self._unit_state * chunk[0]
+        out, self._state = sig.sosfilt(self._sos, chunk, zi=self._state)
+        return out

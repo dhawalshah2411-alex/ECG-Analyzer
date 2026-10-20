@@ -1,5 +1,6 @@
 """Main application window: the ECG dashboard."""
 
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel,
 
 from app.analysis.pipeline import AnalysisPipeline
 from app.database.session_store import SubjectRegistry, save_session
-from app.signal_processing.filters import preprocess
+from app.signal_processing.filters import StreamingFilter
 from app.ui import theme
 from app.ui.recording_dialog import RecordingDialog
 from app.ui.widgets import MetricCard, QualityCard, RecordingCard, format_mmss
@@ -20,9 +21,11 @@ WINDOW_SECONDS = 4.0          # width of the ECG view
 TREND_SECONDS = 60            # width of the heart-rate trend
 DRAW_INTERVAL_MS = 33         # redraw about 30 times a second
 ANALYSIS_INTERVAL_MS = 500    # full analysis twice a second
+MARKER_SEARCH_S = 0.05        # look this far either side of a beat for the trace's top
 SETTLE_SECONDS = 15           # signal shown but not saved before recording;
                               # quality needs 10 s, so this leaves 5 s to act
-FILTER_NOTE = "bandpass 0.5-40 Hz, notch 50 Hz (display only; saved signal is raw)"
+FILTER_NOTE = ("display: bandpass 0.5-40 Hz + notch 50 Hz, forward-only (monitor mode); "
+               "analysis: same filters, zero-phase; saved signal is raw")
 
 
 class MainWindow(QMainWindow):
@@ -41,6 +44,9 @@ class MainWindow(QMainWindow):
         self._description = ""
         self._pipeline = None
         self._result = None
+        self._display_filter = None   # live display filtering, chunk by chunk
+        self._display = deque()       # filtered samples for the ECG view
+        self._display_upto = 0        # absolute sample number filtered up to
 
         self._phase = "idle"          # "idle", "settling" or "recording"
         self._session = None
@@ -210,6 +216,8 @@ class MainWindow(QMainWindow):
         self._units = units
         self._description = description
         self._pipeline = AnalysisPipeline(sample_rate)
+        self._display_filter = StreamingFilter(sample_rate)
+        self._display = deque(maxlen=int(WINDOW_SECONDS * self._fs))
         self.ecg_plot.set_units(units)
 
         self.set_source(f"{description} · ready", active=False)
@@ -232,6 +240,9 @@ class MainWindow(QMainWindow):
         """Clear everything from the previous session."""
         self._buffer.clear()
         self._result = None
+        self._display_filter.reset()
+        self._display.clear()
+        self._display_upto = self._buffer.total_added
         for card in (self.hr_card, self.rr_card, self.sdnn_card):
             card.set_value(None)
         self.quality_card.set_state("unknown")
@@ -257,11 +268,12 @@ class MainWindow(QMainWindow):
         if self._buffer is None:
             return
         values, end = self._snapshot()
-        n = min(len(values), int(WINDOW_SECONDS * self._fs))
+        self._filter_new_samples(values, end)
+        n = min(len(values), len(self._display), int(WINDOW_SECONDS * self._fs))
         if n >= 2:
             raw = values[-n:]
             times = (np.arange(n) - (n - 1)) / self._fs
-            filtered = preprocess(raw, self._fs)
+            filtered = np.asarray(self._display)[-n:]
             self.ecg_plot.set_data(times, filtered, raw)
 
             shown = raw if self.ecg_plot.mode == "raw" else filtered
@@ -270,7 +282,31 @@ class MainWindow(QMainWindow):
 
         self._update_session()
 
+    def _filter_new_samples(self, values, end):
+        """Filter only the samples that arrived since the last frame.
+
+        Filtering just the last 4 s with the zero-phase filter on every
+        frame distorted the newest edge of the trace: when a beat was
+        arriving, it could swing the wrong way by thousands of counts.
+        """
+        new = end - self._display_upto
+        if new <= 0:
+            return
+        if new > len(values):
+            # Fell further behind than the buffer holds: start afresh.
+            new = len(values)
+            self._display_filter.reset()
+            self._display.clear()
+        self._display.extend(self._display_filter.process(values[-new:]))
+        self._display_upto = end
+
     def _draw_markers(self, shown, end, n):
+        """Mark each detected beat, just above the highest point of the trace near it.
+
+        The display filter delays the trace by a few milliseconds, so the
+        trace's value at the exact beat sample can be partway up the R
+        wave. Using the local top keeps every marker clear of the trace.
+        """
         if self._result is None or len(self._result.peak_samples) == 0:
             self.ecg_plot.set_markers([], [])
             return
@@ -278,7 +314,9 @@ class MainWindow(QMainWindow):
         idx = self._result.peak_samples - first
         idx = idx[(idx >= 0) & (idx < n)]
         times = (idx - (n - 1)) / self._fs
-        self.ecg_plot.set_markers(times, shown[idx])
+        half = max(1, int(MARKER_SEARCH_S * self._fs))
+        tops = [shown[max(0, i - half):i + half + 1].max() for i in idx]
+        self.ecg_plot.set_markers(times, tops)
 
     def _draw_trend(self, end):
         if self._result is None or len(self._result.trend_samples) == 0:
