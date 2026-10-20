@@ -1,5 +1,6 @@
 """Main application window: the ECG dashboard."""
 
+import time
 from collections import deque
 from datetime import datetime
 
@@ -7,13 +8,16 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel,
-                               QMainWindow, QPushButton, QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QPushButton, QVBoxLayout,
+                               QWidget)
 
 from app.analysis.pipeline import AnalysisPipeline
+from app.analysis.report import build_report
 from app.database.session_store import SubjectRegistry, save_session
 from app.signal_processing.filters import StreamingFilter
 from app.ui import theme
 from app.ui.recording_dialog import RecordingDialog
+from app.ui.report_window import ReportWindow
 from app.ui.widgets import MetricCard, QualityCard, RecordingCard, format_mmss
 from app.visualization.ecg_plot import ECGPlot
 
@@ -24,6 +28,7 @@ ANALYSIS_INTERVAL_MS = 500    # full analysis twice a second
 MARKER_SEARCH_S = 0.05        # look this far either side of a beat for the trace's top
 SETTLE_SECONDS = 15           # signal shown but not saved before recording;
                               # quality needs 10 s, so this leaves 5 s to act
+RATE_TOLERANCE = 0.05         # refuse to record if samples arrive >5% off the expected rate
 FILTER_NOTE = ("display: bandpass 0.5-40 Hz + notch 50 Hz, forward-only (monitor mode); "
                "analysis: same filters, zero-phase; saved signal is raw")
 
@@ -51,7 +56,10 @@ class MainWindow(QMainWindow):
         self._phase = "idle"          # "idle", "settling" or "recording"
         self._session = None
         self._settle_start = 0
+        self._settle_clock = 0.0      # computer clock when settling began
+        self._capture_clock = 0.0     # computer clock when recording began
         self._registry = SubjectRegistry()
+        self._report_windows = []     # kept here so open reports aren't closed by Python
 
         central = QWidget()
         central.setObjectName("central")
@@ -328,17 +336,24 @@ class MainWindow(QMainWindow):
     # --- slow loop: analysis ------------------------------------------
 
     def _analyse(self):
+        """Run the analysis and update the cards.
+
+        While the quality check says Poor, the numbers are hidden (shown
+        as a dash): the beats behind them are probably noise. On the first
+        real recordings, electrode artifacts made the heart-rate card show
+        up to 191 bpm in large type while the quality card said Poor.
+        """
         if self._buffer is None:
             return
         values, end = self._snapshot()
         self._result = self._pipeline.process(values, end_sample=end)
 
-        self.hr_card.set_value(self._result.bpm)
-        self.rr_card.set_value(self._result.rr_ms)
-        sdnn = self._result.sdnn_ms if self._buffer.is_full() else None
-        self.sdnn_card.set_value(sdnn)
-
         quality = self._result.quality
+        trusted = quality.state != "poor"
+        self.hr_card.set_value(self._result.bpm if trusted else None)
+        self.rr_card.set_value(self._result.rr_ms if trusted else None)
+        full = self._buffer.is_full()
+        self.sdnn_card.set_value(self._result.sdnn_ms if trusted and full else None)
         self.quality_card.set_state(quality.state, quality.reason)
 
     # --- session flow -------------------------------------------------
@@ -385,6 +400,7 @@ class MainWindow(QMainWindow):
         self._settle_start = self._buffer.total_added
         self._record_button.setText("■  Cancel")
         self._start_streaming()
+        self._settle_clock = time.perf_counter()
         self._update_session()
 
     def _update_session(self):
@@ -394,6 +410,8 @@ class MainWindow(QMainWindow):
             remaining = SETTLE_SECONDS - settled
             if remaining > 0:
                 self.recording_card.set_settling(remaining, self._session["subject_id"])
+                return
+            if not self._rate_is_correct():
                 return
             self._begin_capture()
 
@@ -405,8 +423,33 @@ class MainWindow(QMainWindow):
             if elapsed >= total:
                 self._finish_recording(early=False)
 
+    def _rate_is_correct(self):
+        """Check the samples that arrived while settling against the computer's clock.
+
+        The app tells time by counting samples, so a device that sends
+        faster or slower than it should makes every time, heart rate and
+        recording length wrong, with nothing on screen to show it. This
+        happened twice on the first day: an old sketch sent about 6,400
+        samples a second, and so did a catch-up burst after a pause.
+        """
+        elapsed = time.perf_counter() - self._settle_clock
+        received = self._buffer.total_added - self._settle_start
+        measured = received / elapsed if elapsed > 0 else 0.0
+        self._session["info"]["settling_rate_hz"] = round(measured, 1)
+        if abs(measured - self._fs) <= RATE_TOLERANCE * self._fs:
+            return True
+
+        message = (f"Samples arrived at {measured:.0f} per second instead of "
+                   f"{self._fs:.0f}, so every time and heart rate would be wrong. "
+                   f"Nothing was recorded.\n\nRe-upload the firmware, then check "
+                   f"the speed with:  py test_rate.py")
+        self._end_session("Stopped: wrong sample rate — nothing recorded.")
+        QMessageBox.warning(self, "Sample rate problem", message)
+        return False
+
     def _begin_capture(self):
         self._session["started"] = datetime.now()
+        self._capture_clock = time.perf_counter()
         self._buffer.start_capture()
         self._phase = "recording"
         self._rec_label.show()
@@ -415,20 +458,45 @@ class MainWindow(QMainWindow):
     def _finish_recording(self, early):
         session = self._session
         samples = self._buffer.stop_capture()
+        elapsed = time.perf_counter() - self._capture_clock
+        measured = len(samples) / elapsed if elapsed > 0 else 0.0
         samples = samples[:int(session["duration_s"] * self._fs)]
 
         if len(samples) < self._fs:
             self._end_session("Recording under 1 second — not saved.")
             return
 
-        info = dict(session["info"], stopped_early=early)
+        info = dict(session["info"], stopped_early=early,
+                    measured_rate_hz=round(measured, 1))
         try:
             path = save_session(session["subject_id"], samples, self._fs,
                                 self._units, session["started"], info)
-            message = f"Saved {path.name} · {format_mmss(len(samples) / self._fs)}"
         except (OSError, ValueError) as error:
-            message = f"Couldn't save the recording: {error}"
-        self._end_session(message)
+            self._end_session(f"Couldn't save the recording: {error}")
+            return
+
+        saved = (f"Saved {path.name} · {format_mmss(len(samples) / self._fs)}"
+                 f" · measured {measured:.0f} samples/s")
+        self._end_session(saved + " · preparing the report…")
+        details = " · ".join(str(info[k]) for k in ("gender", "age", "notes") if info.get(k))
+        # A short delay lets the "preparing" message appear before the
+        # analysis (about a second) keeps the window busy.
+        QTimer.singleShot(50, lambda: self._open_report(
+            samples, path.name, details, info.get("gender"), saved))
+
+    def _open_report(self, samples, title, details, sex, saved_message):
+        """Analyse the saved recording and show its Report window."""
+        try:
+            report = build_report(samples, self._fs)
+        except Exception as error:     # never lose the session over a report
+            self.recording_card.set_idle(f"{saved_message} · report failed: {error}")
+            return
+        window = ReportWindow(report, title, details, units=self._units, sex=sex)
+        self._report_windows.append(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self.recording_card.set_idle(saved_message)
 
     def _end_session(self, message):
         """Return to idle: stop streaming, keep the last trace on screen."""
