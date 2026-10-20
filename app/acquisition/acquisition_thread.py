@@ -17,9 +17,10 @@ class AcquisitionThread:
         self._running = threading.Event()
 
     def start(self):
-        """Begin acquiring in the background."""
+        """Begin acquiring in the background, discarding stale data first."""
         if self._thread is not None:
             return
+        self.serial.flush()
         self._running.set()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()

@@ -210,6 +210,7 @@ class MainWindow(QMainWindow):
         self._units = units
         self._description = description
         self._pipeline = AnalysisPipeline(sample_rate)
+        self.ecg_plot.set_units(units)
 
         self.set_source(f"{description} · ready", active=False)
         self._record_button.setEnabled(True)

@@ -40,6 +40,17 @@ class SerialManager:
         self._serial = serial.Serial(self.port, self.baud, timeout=1)
         return self.port
 
+    def flush(self):
+        """Discard any data waiting in the port's input buffer.
+
+        The Arduino keeps sending while acquisition is paused, and the
+        operating system stores those samples. Without flushing, they
+        would all arrive at once when acquisition restarts — old signal
+        presented as live, and possibly saved into a new recording.
+        """
+        if self._serial is not None and self._serial.is_open:
+            self._serial.reset_input_buffer()
+
     def read_sample(self):
         """Return the next sample as an int, or None if the line was unusable."""
         raw = self._serial.readline()
@@ -54,4 +65,3 @@ class SerialManager:
         if self._serial is not None and self._serial.is_open:
             self._serial.close()
         self._serial = None
-        

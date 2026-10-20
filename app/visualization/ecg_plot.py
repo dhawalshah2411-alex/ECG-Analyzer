@@ -1,18 +1,23 @@
 """ECG waveform display with a clinical-standard grid.
 
-Gridlines follow ECG paper proportions: minor every 0.04 s / 0.1 mV,
-major every 0.2 s / 0.5 mV. Supports raw, filtered and overlay views,
-markers on detected beats, and a caption stating the scale.
+Gridlines follow ECG paper proportions horizontally: minor every 0.04 s,
+major every 0.2 s. Vertically, calibrated signals (mV) use 0.1 / 0.5 mV;
+uncalibrated signals (raw ADC counts) use 100 / 500 counts and say so.
+
+Supports raw, filtered and overlay views, markers on detected beats,
+and a caption stating the scale.
 """
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtGui import QColor
 
-MINOR_TIME = 0.04   # seconds
+MINOR_TIME = 0.04       # seconds
 MAJOR_TIME = 0.20
-MINOR_MV = 0.1      # millivolts
+MINOR_MV = 0.1          # millivolts
 MAJOR_MV = 0.5
+MINOR_COUNTS = 100      # ADC counts, uncalibrated
+MAJOR_COUNTS = 500
 
 PAPER = QColor(255, 251, 250)
 MINOR_LINE = QColor(252, 234, 230)
@@ -23,20 +28,24 @@ MARKER = QColor(163, 45, 45)
 CAPTION = QColor(114, 36, 62)
 
 MODES = ("raw", "filtered", "overlay")
-DEFAULT_CAPTION = "Small square = 0.04 s × 0.1 mV"
-MARKER_OFFSET_MV = 0.18     # how far above the peak the marker sits
+CAPTION_MV = "Small square = 0.04 s × 0.1 mV"
+CAPTION_COUNTS = "Uncalibrated · small square = 0.04 s × 100 counts"
 
 
 class ECGPlot(pg.PlotWidget):
     """A PyQtGraph plot styled as clinical ECG paper."""
 
     def __init__(self, window_seconds=4.0, mv_range=(-1.5, 1.5),
-                 show_minor_grid=True, mode="filtered", parent=None):
+                 count_range=(-2000, 2000), show_minor_grid=True,
+                 mode="filtered", units="mV", parent=None):
         super().__init__(parent)
         self.window_seconds = window_seconds
         self.mv_range = mv_range
+        self.count_range = count_range
         self.show_minor_grid = show_minor_grid
         self._mode = mode
+        self._grid_items = []
+        self._y_range = mv_range
 
         self.setBackground(PAPER)
         self.setAntialiasing(False)
@@ -44,14 +53,9 @@ class ECGPlot(pg.PlotWidget):
         self.setMouseEnabled(x=False, y=False)
         self.hideButtons()
         self.getPlotItem().layout.setContentsMargins(4, 12, 12, 4)
-
         self.setXRange(-window_seconds, 0.0, padding=0)
-        self.setYRange(mv_range[0], mv_range[1], padding=0)
         self.setLabel("bottom", "Time", units="s")
-        self.setLabel("left", "Amplitude", units="mV")
         self.showGrid(x=False, y=False)
-
-        self._draw_grid()
 
         self.raw_curve = self.plot(pen=pg.mkPen(RAW_TRACE, width=1.0))
         self.raw_curve.setZValue(1)
@@ -63,40 +67,67 @@ class ECGPlot(pg.PlotWidget):
         self.markers.setZValue(3)
         self.addItem(self.markers)
 
-        self.caption = pg.TextItem(DEFAULT_CAPTION, color=CAPTION, anchor=(0, 0))
-        self.caption.setPos(-window_seconds, mv_range[1])
+        self.caption = pg.TextItem("", color=CAPTION, anchor=(0, 0))
         self.caption.setZValue(4)
         self.addItem(self.caption)
 
+        self.set_units(units)
         self.set_mode(mode)
 
-    def _draw_grid(self):
-        """Draw the ECG paper grid behind the traces."""
-        y0, y1 = self.mv_range
+    # --- units and grid -------------------------------------------------
 
+    def set_units(self, units):
+        """Switch between calibrated ('mV') and uncalibrated (counts) display."""
+        self.units = units
+        if units == "mV":
+            self._y_range = self.mv_range
+            minor, major = MINOR_MV, MAJOR_MV
+            self.setLabel("left", "Amplitude", units="mV")
+            self.caption.setText(CAPTION_MV)
+        else:
+            self._y_range = self.count_range
+            minor, major = MINOR_COUNTS, MAJOR_COUNTS
+            self.setLabel("left", "Amplitude (ADC counts)")
+            self.caption.setText(CAPTION_COUNTS)
+
+        self.setYRange(self._y_range[0], self._y_range[1], padding=0)
+        self.caption.setPos(-self.window_seconds, self._y_range[1])
+        self._draw_grid(minor, major)
+
+    def _draw_grid(self, minor_step, major_step):
+        """Draw the ECG paper grid behind the traces."""
+        for item in self._grid_items:
+            self.removeItem(item)
+        self._grid_items = []
+
+        y0, y1 = self._y_range
         minor_pen = pg.mkPen(MINOR_LINE, width=1)
         minor_pen.setCosmetic(True)
         major_pen = pg.mkPen(MAJOR_LINE, width=1)
         major_pen.setCosmetic(True)
 
-        steps = [(MAJOR_TIME, MAJOR_MV, major_pen)]
+        steps = [(MAJOR_TIME, major_step, major_pen)]
         if self.show_minor_grid:
-            steps.insert(0, (MINOR_TIME, MINOR_MV, minor_pen))
+            steps.insert(0, (MINOR_TIME, minor_step, minor_pen))
 
-        for t_step, mv_step, pen in steps:
+        for t_step, v_step, pen in steps:
             x = -self.window_seconds
             while x <= 1e-9:
-                line = pg.InfiniteLine(pos=x, angle=90, pen=pen)
-                line.setZValue(-10)
-                self.addItem(line)
+                self._add_line(x, 90, pen)
                 x += t_step
 
-            y = np.ceil(y0 / mv_step) * mv_step
+            y = np.ceil(y0 / v_step) * v_step
             while y <= y1 + 1e-9:
-                line = pg.InfiniteLine(pos=y, angle=0, pen=pen)
-                line.setZValue(-10)
-                self.addItem(line)
-                y += mv_step
+                self._add_line(y, 0, pen)
+                y += v_step
+
+    def _add_line(self, pos, angle, pen):
+        line = pg.InfiniteLine(pos=pos, angle=angle, pen=pen)
+        line.setZValue(-10)
+        self.addItem(line)
+        self._grid_items.append(line)
+
+    # --- view mode ------------------------------------------------------
 
     def set_mode(self, mode):
         """Set the view mode: 'raw', 'filtered' or 'overlay'."""
@@ -108,6 +139,8 @@ class ECGPlot(pg.PlotWidget):
     @property
     def mode(self):
         return self._mode
+
+    # --- data -----------------------------------------------------------
 
     def set_data(self, times, filtered, raw=None):
         """Update the displayed waveform(s)."""
@@ -123,8 +156,9 @@ class ECGPlot(pg.PlotWidget):
         """Place a marker above each detected beat."""
         times = np.asarray(times, dtype=float)
         peak_values = np.asarray(peak_values, dtype=float)
-        self.markers.setData(times, peak_values + MARKER_OFFSET_MV)
+        offset = 0.06 * (self._y_range[1] - self._y_range[0])
+        self.markers.setData(times, peak_values + offset)
 
     def set_caption(self, text):
-        """Change the scale caption, e.g. when units are uncalibrated."""
+        """Override the scale caption."""
         self.caption.setText(text)
