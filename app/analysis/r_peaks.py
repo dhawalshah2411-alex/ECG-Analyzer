@@ -4,7 +4,8 @@ Two detectors are provided so their accuracy can be compared against
 reference annotations:
 
 - simple_detect: threshold and spacing constraints via scipy.find_peaks
-- (Pan-Tompkins to follow)
+- pan_tompkins_detect: the Pan-Tompkins algorithm (band-pass, slope,
+  energy, adaptive thresholds), which produces every displayed number
 """
 
 import numpy as np
@@ -55,12 +56,15 @@ def heart_rate(peaks, fs):
         return 0.0
     return 60.0 / np.mean(rr)
 
-    # --- Pan-Tompkins -----------------------------------------------------
+
+# --- Pan-Tompkins ---------------------------------------------------------
 
 QRS_BAND = (5.0, 15.0)      # Hz — where QRS energy concentrates
 INTEGRATION_S = 0.150       # moving-window width, ~one QRS duration
 REFRACTORY_S = 0.200        # minimum physiological gap between beats
 SEARCHBACK_FACTOR = 1.66    # trigger searchback after this * mean RR
+RELEARN_AFTER_S = 3.0       # no beat for this long: re-learn the levels...
+RELEARN_WINDOW_S = 2.0      # ...from the most recent 2 s of signal
 
 
 def _pt_transform(x, fs):
@@ -92,6 +96,13 @@ def pan_tompkins_detect(x, fs):
     missed beats within a single gap are not all recovered, which is
     the main source of remaining false negatives on records with
     varying beat amplitude (e.g. MIT-BIH 203).
+
+    Re-learning: the signal level (spki) only adapts when a beat is
+    accepted. After loud noise - exercise, a tugged cable - it can stay
+    so high that every later beat falls below the threshold and the
+    detector goes deaf for the rest of the recording. So if no beat has
+    been accepted for 3 s, the levels are re-learned from the last 2 s
+    and that silent gap is scanned again with the new threshold.
     """
     x = np.asarray(x, dtype=float)
     if len(x) < int(fs):
@@ -115,6 +126,8 @@ def pan_tompkins_detect(x, fs):
 
     peaks = []
     rr_recent = []
+    relearn = int(RELEARN_AFTER_S * fs)
+    last_relearn = 0
 
     for c in candidates:
         value = integrated[c]
@@ -146,8 +159,22 @@ def pan_tompkins_detect(x, fs):
                         peaks.sort()
                         spki = 0.25 * integrated[best] + 0.75 * spki
 
+        # Re-learn after a long silence (see the docstring).
+        last = peaks[-1] if peaks else 0
+        if c - last > relearn and c - last_relearn > relearn:
+            recent = integrated[max(0, c - int(RELEARN_WINDOW_S * fs)):c + 1]
+            spki = float(np.percentile(recent, 95))
+            npki = float(np.percentile(recent, 50))
+            threshold = npki + 0.25 * (spki - npki)
+            last_relearn = c
+            for g in candidates[(candidates > last + refractory) & (candidates <= c)]:
+                if integrated[g] > threshold and (not peaks or g - peaks[-1] >= refractory):
+                    peaks.append(int(g))
+            rr_recent = []
+
     return _refine_to_signal_peak(x, np.array(sorted(set(peaks)), dtype=int), fs)
-    
+
+
 def _refine_to_signal_peak(x, peaks, fs, window_s=0.05):
     """Move each detection to the local maximum of the original signal.
 
