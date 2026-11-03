@@ -149,3 +149,54 @@ class RecordingCard(QFrame):
         fraction = min(1.0, elapsed_s / total_s) if total_s else 0.0
         self._bar.setValue(int(1000 * fraction))
         self._bar.show()
+
+
+class PhaseBanner(QFrame):
+    """Large coloured strip telling the person what to do now, during an exercise test."""
+
+    COLOURS = {                       # kind: (background, text)
+        "baseline": (theme.SELECTED_BG, theme.SELECTED_TEXT),
+        "exercise": (theme.ACCENT, "#FFFFFF"),
+        "rest": theme.QUALITY_COLOURS["good"],
+        "recovery": (theme.SELECTED_BG, theme.SELECTED_TEXT),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("banner")
+        self._title = QLabel()
+        self._title.setStyleSheet("font-size: 22px; font-weight: 700;")
+        self._instruction = QLabel()
+        self._instruction.setStyleSheet("font-size: 13px;")
+        self._time = QLabel()
+        self._time.setStyleSheet("font-size: 30px; font-weight: 700;")
+        self._next = QLabel()
+        self._next.setStyleSheet("font-size: 12px;")
+        self._next.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(self._title)
+        text.addWidget(self._instruction)
+        clock = QVBoxLayout()
+        clock.setSpacing(0)
+        clock.addWidget(self._time, 0, Qt.AlignmentFlag.AlignRight)
+        clock.addWidget(self._next)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.addLayout(text, 1)
+        layout.addLayout(clock)
+        self.hide()
+
+    def show_phase(self, kind, title, instruction, left_s, next_text):
+        """Show the current phase, its time left, and what comes next."""
+        bg, fg = self.COLOURS.get(kind, self.COLOURS["baseline"])
+        self.setStyleSheet(
+            f"QFrame#banner {{ background: {bg}; border-radius: 8px; }}"
+            f"QLabel {{ color: {fg}; background: transparent; }}")
+        self._title.setText(title)
+        self._instruction.setText(instruction)
+        self._time.setText(format_mmss(left_s))
+        self._next.setText(next_text)
+        self.show()

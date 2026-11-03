@@ -7,15 +7,25 @@ Vertically, calibrated signals (mV) use the fixed clinical scale of
 0.1 / 0.5 mV per square. Uncalibrated signals (raw ADC counts) have no
 standard scale: their size depends on the person, the electrode
 positions and the amplifier. So in counts the view fits itself to the
-trace — it grows at once when the signal gets bigger, and shrinks only
-after the signal has stayed small for a few seconds, so it does not
-jump on every beat. The caption always states the current scale.
+size of a typical beat, and then holds still:
+
+- the size is measured once every 1.5 s, and the median of the last
+  8 measurements (12 s) is used, so one tall spike from touching an
+  electrode cannot change the scale; the spike just runs off the edge
+  for a moment;
+- the view grows only if typical beats have been cut off for 3 s, and
+  shrinks only if they have used under 35% of it for 15 s.
+
+The first version grew at once for any spike and shrank 3 s later, so
+the axis jumped during real recordings. The caption always states the
+current scale.
 
 Supports raw, filtered and overlay views, markers on detected beats,
 and a caption stating the scale.
 """
 
 import time
+from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
@@ -32,9 +42,14 @@ MAJOR_COUNTS = 500
 COUNT_STEPS = (100, 200, 250, 500, 1000, 2000)  # allowed counts per small square
 TARGET_ROWS = 50        # at most this many small squares from bottom to top
 MIN_COUNT_SPAN = 2000   # never zoom in further than this (avoids magnifying noise)
-FIT_MARGIN = 0.10       # headroom above and below the trace, as a fraction of its span
-SHRINK_BELOW = 0.7      # shrink only if the trace needs less than 70% of the view...
-SHRINK_AFTER_S = 3.0    # ...for at least this long
+CHUNK_S = 1.5           # measure the trace's top and bottom once per 1.5 s
+                        # (each chunk holds a beat at any rate above 40 bpm)
+HISTORY_CHUNKS = 8      # typical size = median of the last 8 chunks (12 s)
+STARTUP_CHUNKS = 3      # until 3 chunks are measured, fit at every chunk
+HEADROOM = 0.25         # space above and below a typical beat, as a fraction of its height
+GROW_AFTER = 2          # grow only if typical beats are cut off for 2 chunks in a row (3 s)
+SHRINK_BELOW = 0.35     # shrink only if typical beats use under 35% of the view...
+SHRINK_AFTER = 10       # ...for 10 chunks in a row (15 s)
 
 PAPER = QColor(255, 251, 250)
 MINOR_LINE = QColor(252, 234, 230)
@@ -65,7 +80,7 @@ class ECGPlot(pg.PlotWidget):
         self._grid_items = []
         self._y_range = mv_range
         self._count_step = MINOR_COUNTS
-        self._small_since = None      # when the trace first became small enough to shrink for
+        self._reset_fit()
 
         self.setBackground(PAPER)
         self.setAntialiasing(False)
@@ -105,7 +120,7 @@ class ECGPlot(pg.PlotWidget):
         else:
             self.setLabel("left", "Amplitude (ADC counts)")
             self._count_step = MINOR_COUNTS
-            self._small_since = None
+            self._reset_fit()
             self._apply_range(self.count_range, MINOR_COUNTS, MAJOR_COUNTS)
 
     @property
@@ -164,40 +179,70 @@ class ECGPlot(pg.PlotWidget):
 
     # --- fitting uncalibrated signals -----------------------------------
 
-    def _fit_to(self, traces, now=None):
-        """Grow or shrink the counts view so the traces fit.
+    def _reset_fit(self):
+        """Forget the measured beat size (new session, or a different view mode)."""
+        self._tops = deque(maxlen=HISTORY_CHUNKS)
+        self._bottoms = deque(maxlen=HISTORY_CHUNKS)
+        self._chunk_started = None    # clock time the current chunk began
+        self._cut_count = 0           # chunks in a row with typical beats cut off
+        self._small_count = 0         # chunks in a row with typical beats too small
 
-        Grows immediately if any part of the trace would be cut off.
-        Shrinks only after the trace has needed less than 70% of the view
-        for SHRINK_AFTER_S seconds, so a single tall artifact does not
-        leave the view zoomed out for good, and normal beats do not make
-        it jump. `now` exists for testing; normally the clock is used.
+    def _fit_to(self, traces, times, now=None):
+        """Keep the counts view fitted to a typical beat, changing it rarely.
+
+        `now` exists for testing; normally the clock is used.
         """
         data = [np.asarray(t, dtype=float) for t in traces if t is not None and len(t)]
         if not data:
+            self._reset_fit()
             return
-        data = np.concatenate(data)
-        lo, hi = float(np.min(data)), float(np.max(data))
-        span = max(hi - lo, MIN_COUNT_SPAN)
-        middle = (lo + hi) / 2.0
-        want_lo = middle - span * (0.5 + FIT_MARGIN)
-        want_hi = middle + span * (0.5 + FIT_MARGIN)
+        now = time.monotonic() if now is None else now
+
+        if self._chunk_started is None:
+            # Start of a session: fit at once so the first beats are on screen.
+            self._chunk_started = now
+            self._fit_beat(min(d.min() for d in data), max(d.max() for d in data))
+            return
+        if now - self._chunk_started < CHUNK_S:
+            if not self._tops:
+                # Before the first measurement, grow at once if anything is cut off.
+                lo, hi = min(d.min() for d in data), max(d.max() for d in data)
+                if lo < self._y_range[0] or hi > self._y_range[1]:
+                    self._fit_beat(lo, hi)
+            return
+        self._chunk_started = now
+
+        times = np.asarray(times, dtype=float)
+        recent = times > times[-1] - CHUNK_S
+        self._tops.append(max(d[recent].max() for d in data))
+        self._bottoms.append(min(d[recent].min() for d in data))
+        top, bottom = float(np.median(self._tops)), float(np.median(self._bottoms))
 
         cur_lo, cur_hi = self._y_range
-        if want_lo < cur_lo or want_hi > cur_hi:
-            self._small_since = None
-            self._set_count_range(want_lo, want_hi)
-            return
-
-        if (want_hi - want_lo) < SHRINK_BELOW * (cur_hi - cur_lo):
-            now = time.monotonic() if now is None else now
-            if self._small_since is None:
-                self._small_since = now
-            elif now - self._small_since >= SHRINK_AFTER_S:
-                self._small_since = None
-                self._set_count_range(want_lo, want_hi)
+        if len(self._tops) < STARTUP_CHUNKS:
+            self._fit_beat(bottom, top)
+        elif top > cur_hi or bottom < cur_lo:
+            self._cut_count += 1
+            self._small_count = 0
+            if self._cut_count >= GROW_AFTER:
+                self._fit_beat(bottom, top)
+        elif top - bottom < SHRINK_BELOW * (cur_hi - cur_lo):
+            self._small_count += 1
+            self._cut_count = 0
+            if self._small_count >= SHRINK_AFTER:
+                self._fit_beat(bottom, top)
         else:
-            self._small_since = None
+            self._cut_count = self._small_count = 0
+
+    def _fit_beat(self, bottom, top):
+        """Set the view around a beat from `bottom` to `top`, with headroom."""
+        margin = HEADROOM * (top - bottom)
+        lo, hi = bottom - margin, top + margin
+        if hi - lo < MIN_COUNT_SPAN:
+            middle = (lo + hi) / 2.0
+            lo, hi = middle - MIN_COUNT_SPAN / 2.0, middle + MIN_COUNT_SPAN / 2.0
+        self._cut_count = self._small_count = 0
+        self._set_count_range(lo, hi)
 
     def _set_count_range(self, lo, hi):
         """Pick a grid step for this span, then snap the range to whole large squares."""
@@ -219,6 +264,8 @@ class ECGPlot(pg.PlotWidget):
         """Set the view mode: 'raw', 'filtered' or 'overlay'."""
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        if mode != self._mode:
+            self._reset_fit()         # raw and filtered sit at very different levels
         self._mode = mode
         self.raw_curve.setVisible(mode == "overlay")
         self._update_caption()
@@ -251,7 +298,7 @@ class ECGPlot(pg.PlotWidget):
             self.raw_curve.setData(times, extra)
 
         if not self.calibrated:
-            self._fit_to([main, extra])
+            self._fit_to([main, extra], times)
 
     def set_markers(self, times, peak_values):
         """Place a marker above each detected beat."""

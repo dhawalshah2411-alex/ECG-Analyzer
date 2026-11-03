@@ -1,5 +1,7 @@
 """Main application window: the ECG dashboard."""
 
+import math
+import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -7,18 +9,21 @@ from datetime import datetime
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QPushButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QHBoxLayout,
+                               QLabel, QMainWindow, QMessageBox, QPushButton,
+                               QVBoxLayout, QWidget)
 
+from app.analysis.exercise_test import phases_from_dicts
 from app.analysis.pipeline import AnalysisPipeline
 from app.analysis.report import build_report
 from app.database.session_store import SubjectRegistry, save_session
 from app.signal_processing.filters import StreamingFilter
 from app.ui import theme
+from app.ui.exercise_window import open_exercise
 from app.ui.recording_dialog import RecordingDialog
 from app.ui.report_window import ReportWindow
-from app.ui.widgets import MetricCard, QualityCard, RecordingCard, format_mmss
+from app.ui.widgets import (MetricCard, PhaseBanner, QualityCard, RecordingCard,
+                            format_mmss)
 from app.visualization.ecg_plot import ECGPlot
 
 WINDOW_SECONDS = 4.0          # width of the ECG view
@@ -29,12 +34,45 @@ MARKER_SEARCH_S = 0.05        # look this far either side of a beat for the trac
 SETTLE_SECONDS = 15           # signal shown but not saved before recording;
                               # quality needs 10 s, so this leaves 5 s to act
 RATE_TOLERANCE = 0.05         # refuse to record if samples arrive >5% off the expected rate
+WARN_S = 5                    # exercise test: beep this many seconds before each change
 FILTER_NOTE = ("display: bandpass 0.5-40 Hz + notch 50 Hz, forward-only (monitor mode); "
                "analysis: same filters, zero-phase; saved signal is raw")
+DEVICE_LOST = ("The ECG device stopped sending ({error}).\n\n{saved}\n\n"
+               "Check the USB cable, then press New recording: the app connects again by itself.")
+REGISTRY_LOCKED = ("{path} is open in another program, probably Excel, so the app can't "
+                   "add to it.\n\nClose it there (choose Don't Save if asked), then press Retry. "
+                   "The details you typed are kept.")
+
+# What the banner tells the person in each kind of phase.
+PHASE_TEXT = {
+    "baseline": ("REST — sit still", "Measuring the resting heart rate. Exercise starts after this."),
+    "exercise": ("EXERCISE — round {round} of {rounds}", "Exercise at a steady pace."),
+    "rest": ("REST — stand still", "Stop and stand still until the next round."),
+    "recovery": ("RECOVERY — sit down, stay still", "Keep still until the recording ends."),
+}
+
+
+def keep_awake(on):
+    """Stop Windows sleeping or blanking the screen while a recording runs.
+
+    On battery, Windows may sleep after some minutes without a key press,
+    which would cut off the recording. Elsewhere this does nothing.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    continuous, system, display = 0x80000000, 0x00000001, 0x00000002
+    flags = continuous | (system | display if on else 0)
+    ctypes.windll.kernel32.SetThreadExecutionState(flags)
 
 
 class MainWindow(QMainWindow):
-    """Dashboard with a session flow: idle, settling, recording."""
+    """Dashboard with a session flow: idle, settling, recording.
+
+    An exercise test is one recording that follows a timetable of phases
+    (rest, exercise rounds and rests, recovery); a banner shows the phase,
+    and the app beeps before and at every change.
+    """
 
     def __init__(self):
         super().__init__()
@@ -58,6 +96,9 @@ class MainWindow(QMainWindow):
         self._settle_start = 0
         self._settle_clock = 0.0      # computer clock when settling began
         self._capture_clock = 0.0     # computer clock when recording began
+        self._capture_total = 0       # buffer.total_added when recording began
+        self._bad_before = 0          # the device's bad-line count when recording began
+        self._gaps_seen = 0           # silences already shown on screen
         self._registry = SubjectRegistry()
         self._report_windows = []     # kept here so open reports aren't closed by Python
 
@@ -123,9 +164,11 @@ class MainWindow(QMainWindow):
     def _build_body(self):
         self.ecg_plot = ECGPlot(window_seconds=WINDOW_SECONDS, mv_range=(-1.5, 1.5))
         self.trend_plot, self.trend_curve = self._build_trend_plot()
+        self.banner = PhaseBanner()
 
         left = QVBoxLayout()
         left.setSpacing(10)
+        left.addWidget(self.banner)
         left.addWidget(self.ecg_plot, 1)
         left.addWidget(self.trend_plot)
 
@@ -233,6 +276,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(300, self.new_recording)
 
     def _start_streaming(self):
+        keep_awake(True)
         self.set_source(self._description, active=True)
         self._source.start()
         self._draw_timer.start(DRAW_INTERVAL_MS)
@@ -242,6 +286,7 @@ class MainWindow(QMainWindow):
         self._draw_timer.stop()
         self._analysis_timer.stop()
         self._source.stop()
+        keep_awake(False)
         self.set_source(f"{self._description} · stopped", active=False)
 
     def _reset_display(self):
@@ -274,6 +319,9 @@ class MainWindow(QMainWindow):
 
     def _redraw(self):
         if self._buffer is None:
+            return
+        if self._phase != "idle" and self._device_failed():
+            self._device_lost()
             return
         values, end = self._snapshot()
         self._filter_new_samples(values, end)
@@ -370,30 +418,40 @@ class MainWindow(QMainWindow):
         """Ask for subject details, then start a session."""
         if self._source is None or self._phase != "idle":
             return
+        if not self._reconnect():
+            return
         dialog = RecordingDialog(self)
         if not dialog.exec():
             self.recording_card.set_idle()
             return
 
         v = dialog.values()
-        subject_id = self._registry.find_or_create(
-            v["name"], v["age"], v["gender"], v["profession"], v["city"],
-            registered=datetime.now().date().isoformat())
+        subject_id = self._subject_id(v)
+        if subject_id is None:
+            self.recording_card.set_idle("Subject list was open elsewhere — nothing recorded.")
+            return
 
         self._session = {
             "subject_id": subject_id,
+            "test": v["test"],
             "duration_s": v["duration_s"],
+            "phases": phases_from_dicts(v["phases"]),   # empty for a resting recording
+            "phase_index": -1,        # phase shown on the banner
+            "warned": -1,             # phase whose "change coming" beep has sounded
             "started": None,
             "info": {
                 "age": v["age"],
                 "gender": v["gender"],
                 "notes": v["notes"],
+                "test": v["test"],
                 "requested_duration_s": v["duration_s"],
                 "source": self._description,
                 "settle_seconds": SETTLE_SECONDS,
                 "display_filter": FILTER_NOTE,
             },
         }
+        if v["phases"]:
+            self._session["info"]["phases"] = v["phases"]
 
         self._reset_display()
         self._phase = "settling"
@@ -402,6 +460,84 @@ class MainWindow(QMainWindow):
         self._start_streaming()
         self._settle_clock = time.perf_counter()
         self._update_session()
+
+    def _subject_id(self, v):
+        """The subject's ID from the private list, or None if the person gives up.
+
+        If the list is open in Excel, Windows won't let the app add to it.
+        Before, that crashed the session with the error shown only in
+        PowerShell. Now the person is told, and can close it and retry.
+        """
+        while True:
+            try:
+                return self._registry.find_or_create(
+                    v["name"], v["age"], v["gender"], v["profession"], v["city"],
+                    registered=datetime.now().date().isoformat())
+            except PermissionError:
+                answer = QMessageBox.warning(
+                    self, "Subject list is open elsewhere",
+                    REGISTRY_LOCKED.format(path=self._registry.path),
+                    QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel)
+                if answer != QMessageBox.StandardButton.Retry:
+                    return None
+
+    # --- device problems ----------------------------------------------
+
+    def _device_failed(self):
+        """True if the live reader stopped by itself (see AcquisitionThread)."""
+        return getattr(self._source, "failed", False)
+
+    def _device_lost(self):
+        """The device stopped mid-session: keep what was recorded and say what happened."""
+        error = self._source.error
+        if self._phase == "recording":
+            self._session["info"]["stopped_reason"] = f"device stopped sending: {error}"
+            path = self._finish_recording(early=True)
+            saved = (f"What was recorded up to that moment has been saved as {path.name}."
+                     if path else "Less than a second had been recorded, so nothing was saved.")
+        else:
+            self._end_session("The device stopped sending — nothing recorded.")
+            saved = "Nothing had been recorded yet."
+        self.set_source(f"{self._description} · device stopped", active=False)
+        QMessageBox.warning(self, "ECG device stopped",
+                            DEVICE_LOST.format(error=error, saved=saved))
+
+    def _reconnect(self):
+        """After the device stopped, open its port again. False if it can't be found."""
+        serial_mgr = getattr(self._source, "serial", None)
+        if serial_mgr is None or not self._device_failed():
+            return True
+        try:
+            serial_mgr.disconnect()
+        except OSError:
+            pass                              # the old port is gone already
+        serial_mgr.port = None                # find it again: it may come back on a new COM port
+        try:
+            port = serial_mgr.connect()
+        except OSError as error:
+            QMessageBox.warning(self, "ECG device not found",
+                                f"{error}\n\nPlug the Arduino in, close Arduino IDE's Serial "
+                                "Monitor if it is open, then press New recording again.")
+            return False
+        self._description = f"Live · Arduino on {port} · {self._fs:.0f} Hz"
+        self.set_source(f"{self._description} · ready", active=False)
+        return True
+
+    def _signal_problems(self, n):
+        """Where, in this recording, the device sent bad lines or went silent (seconds)."""
+        start = self._capture_total
+
+        def seconds(positions):
+            return [round((p - start) / self._fs, 3) for p in positions if start <= p <= start + n]
+
+        problems = {}
+        serial_mgr = getattr(self._source, "serial", None)
+        if serial_mgr is not None:
+            problems["bad_samples_replaced"] = serial_mgr.bad_lines - self._bad_before
+            problems["bad_samples_at_s"] = seconds(serial_mgr.bad_at)
+        if hasattr(self._source, "gaps_at"):
+            problems["signal_gaps_at_s"] = seconds(self._source.gaps_at)
+        return problems
 
     def _update_session(self):
         """Advance settling into recording; stop at the chosen duration."""
@@ -416,12 +552,49 @@ class MainWindow(QMainWindow):
             self._begin_capture()
 
         if self._phase == "recording":
+            gaps = getattr(self._source, "gaps_at", [])
+            if len(gaps) > self._gaps_seen:
+                self._gaps_seen = len(gaps)
+                at = format_mmss((gaps[-1] - self._capture_total) / self._fs)
+                self.set_source(f"{self._description} · no signal for 1 s or more at {at} "
+                                "— marked in the recording", active=True)
             elapsed = self._buffer.captured_count / self._fs
             total = self._session["duration_s"]
             self.recording_card.set_progress(min(elapsed, total), total,
                                              self._session["subject_id"])
+            if self._session["phases"]:
+                self._update_phase(min(elapsed, total - 0.01))
             if elapsed >= total:
                 self._finish_recording(early=False)
+
+    def _update_phase(self, elapsed):
+        """Show the current phase on the banner; beep before and at each change."""
+        s = self._session
+        phases = s["phases"]
+        i = next((k for k, p in enumerate(phases) if p.start_s <= elapsed < p.end_s),
+                 len(phases) - 1)
+        if i != s["phase_index"]:
+            if s["phase_index"] >= 0:
+                QApplication.beep()
+            s["phase_index"] = i
+
+        p = phases[i]
+        left = p.end_s - elapsed
+        nxt = phases[i + 1] if i + 1 < len(phases) else None
+        if nxt is not None and left <= WARN_S and s["warned"] != i:
+            QApplication.beep()
+            s["warned"] = i
+
+        rounds = sum(1 for q in phases if q.kind == "exercise")
+        title, instruction = PHASE_TEXT[p.kind]
+        title = title.format(round=p.round, rounds=rounds)
+        if nxt is None:
+            upcoming = "Then: the report opens"
+        elif left <= WARN_S:
+            upcoming = f"{nxt.label} in {math.ceil(left)} s"
+        else:
+            upcoming = f"Next: {nxt.label} ({format_mmss(nxt.duration_s)})"
+        self.banner.show_phase(p.kind, title, instruction, left, upcoming)
 
     def _rate_is_correct(self):
         """Check the samples that arrived while settling against the computer's clock.
@@ -450,12 +623,20 @@ class MainWindow(QMainWindow):
     def _begin_capture(self):
         self._session["started"] = datetime.now()
         self._capture_clock = time.perf_counter()
+        # Positions of bad lines and silences are counted in samples since
+        # streaming began; these turn them into times within the recording
+        # (to within one sample, 2 ms: the reader runs alongside).
+        self._capture_total = self._buffer.total_added
+        serial_mgr = getattr(self._source, "serial", None)
+        self._bad_before = serial_mgr.bad_lines if serial_mgr is not None else 0
+        self._gaps_seen = len(getattr(self._source, "gaps_at", []))
         self._buffer.start_capture()
         self._phase = "recording"
         self._rec_label.show()
         self._record_button.setText("■  Stop and save")
 
     def _finish_recording(self, early):
+        """Save the recording and open its report. Returns the saved path, or None."""
         session = self._session
         samples = self._buffer.stop_capture()
         elapsed = time.perf_counter() - self._capture_clock
@@ -464,25 +645,37 @@ class MainWindow(QMainWindow):
 
         if len(samples) < self._fs:
             self._end_session("Recording under 1 second — not saved.")
-            return
+            return None
 
+        problems = self._signal_problems(len(samples))
         info = dict(session["info"], stopped_early=early,
-                    measured_rate_hz=round(measured, 1))
+                    measured_rate_hz=round(measured, 1), **problems)
         try:
             path = save_session(session["subject_id"], samples, self._fs,
                                 self._units, session["started"], info)
         except (OSError, ValueError) as error:
             self._end_session(f"Couldn't save the recording: {error}")
-            return
+            return None
 
         saved = (f"Saved {path.name} · {format_mmss(len(samples) / self._fs)}"
                  f" · measured {measured:.0f} samples/s")
+        if problems.get("bad_samples_replaced"):
+            saved += f" · {problems['bad_samples_replaced']} bad sample(s) replaced"
+        if problems.get("signal_gaps_at_s"):
+            saved += (f" · {len(problems['signal_gaps_at_s'])} gap(s) in the signal: "
+                      "beat times across a gap are wrong")
         self._end_session(saved + " · preparing the report…")
         details = " · ".join(str(info[k]) for k in ("gender", "age", "notes") if info.get(k))
         # A short delay lets the "preparing" message appear before the
-        # analysis (about a second) keeps the window busy.
-        QTimer.singleShot(50, lambda: self._open_report(
-            samples, path.name, details, info.get("gender"), saved))
+        # analysis (a second or two) keeps the window busy.
+        if session["phases"]:
+            phases, age = session["phases"], info.get("age")
+            QTimer.singleShot(50, lambda: self._open_exercise(
+                samples, phases, age, path.name, details, saved))
+        else:
+            QTimer.singleShot(50, lambda: self._open_report(
+                samples, path.name, details, info.get("gender"), saved))
+        return path
 
     def _open_report(self, samples, title, details, sex, saved_message):
         """Analyse the saved recording and show its Report window."""
@@ -492,11 +685,24 @@ class MainWindow(QMainWindow):
             self.recording_card.set_idle(f"{saved_message} · report failed: {error}")
             return
         window = ReportWindow(report, title, details, units=self._units, sex=sex)
+        self._show_window(window)
+        self.recording_card.set_idle(saved_message)
+
+    def _open_exercise(self, samples, phases, age, title, details, saved_message):
+        """Analyse a saved exercise test and show its report."""
+        try:
+            window = open_exercise(samples, self._fs, phases, age, title, details)
+        except Exception as error:     # never lose the session over a report
+            self.recording_card.set_idle(f"{saved_message} · report failed: {error}")
+            return
+        self._show_window(window)
+        self.recording_card.set_idle(saved_message)
+
+    def _show_window(self, window):
         self._report_windows.append(window)
         window.show()
         window.raise_()
         window.activateWindow()
-        self.recording_card.set_idle(saved_message)
 
     def _end_session(self, message):
         """Return to idle: stop streaming, keep the last trace on screen."""
@@ -505,6 +711,7 @@ class MainWindow(QMainWindow):
         self._stop_streaming()
         self._phase = "idle"
         self._session = None
+        self.banner.hide()
         self._rec_label.hide()
         self._record_button.setText("●  New recording")
         self.recording_card.set_idle(message)

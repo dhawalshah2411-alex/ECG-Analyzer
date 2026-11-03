@@ -65,12 +65,17 @@ REFRACTORY_S = 0.200        # minimum physiological gap between beats
 SEARCHBACK_FACTOR = 1.66    # trigger searchback after this * mean RR
 RELEARN_AFTER_S = 3.0       # no beat for this long: re-learn the levels...
 RELEARN_WINDOW_S = 2.0      # ...from the most recent 2 s of signal
+T_WAVE_S = 0.360            # a candidate this soon after a beat may be its T wave...
+T_SLOPE_FRACTION = 0.5      # ...and is taken as one if its steepest slope is under
+                            # half that of the beat before it
 
 
 def _pt_transform(x, fs):
     """Band-pass, differentiate, square and integrate.
 
-    Turns each QRS complex into a single smooth positive bump.
+    Turns each QRS complex into a single smooth positive bump. Also
+    returns the slope (the differentiated band-passed signal), which
+    tells a steep QRS from a rounded T wave.
     """
     nyq = fs / 2.0
     low, high = QRS_BAND[0] / nyq, min(QRS_BAND[1] / nyq, 0.99)
@@ -83,7 +88,7 @@ def _pt_transform(x, fs):
     width = max(1, int(INTEGRATION_S * fs))
     window = np.ones(width) / width
     integrated = np.convolve(squared, window, mode="same")
-    return integrated
+    return integrated, deriv
 
 
 def pan_tompkins_detect(x, fs):
@@ -97,6 +102,12 @@ def pan_tompkins_detect(x, fs):
     the main source of remaining false negatives on records with
     varying beat amplitude (e.g. MIT-BIH 203).
 
+    T waves: a candidate within 360 ms of the beat before it, with a
+    steepest slope under half that beat's, is a T wave (or the rounded
+    second half of an unusual beat), not a new beat - the rule from the
+    original Pan-Tompkins paper. Without it, a real recording with
+    unusually shaped beats had nearly every one of them counted twice.
+
     Re-learning: the signal level (spki) only adapts when a beat is
     accepted. After loud noise - exercise, a tugged cable - it can stay
     so high that every later beat falls below the threshold and the
@@ -108,7 +119,13 @@ def pan_tompkins_detect(x, fs):
     if len(x) < int(fs):
         return np.array([], dtype=int)
 
-    integrated = _pt_transform(x, fs)
+    integrated, deriv = _pt_transform(x, fs)
+    width = max(1, int(INTEGRATION_S * fs))
+    t_wave = int(T_WAVE_S * fs)
+
+    def steepest(c):
+        """Steepest slope of the QRS whose energy peaks at c (it comes just before)."""
+        return float(np.abs(deriv[max(0, c - width):c + 1]).max())
 
     refractory = max(1, int(REFRACTORY_S * fs))
     candidates, _ = sig.find_peaks(integrated, distance=refractory)
@@ -134,6 +151,11 @@ def pan_tompkins_detect(x, fs):
 
         if value > threshold:
             if peaks and (c - peaks[-1]) < refractory:
+                continue
+            if (peaks and (c - peaks[-1]) < t_wave
+                    and steepest(c) < T_SLOPE_FRACTION * steepest(peaks[-1])):
+                npki = 0.125 * value + 0.875 * npki      # a T wave: treat as noise
+                threshold = npki + 0.25 * (spki - npki)
                 continue
             peaks.append(int(c))
             spki = 0.125 * value + 0.875 * spki

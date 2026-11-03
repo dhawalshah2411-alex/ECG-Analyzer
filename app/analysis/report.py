@@ -9,23 +9,24 @@ from PowerShell:
     py -m app.analysis.report recordings/S001/S001_20261020_193742
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from app.analysis.intervals import BeatIntervals, measure
 from app.analysis.r_peaks import pan_tompkins_detect, simple_detect
 from app.signal_processing.filters import preprocess
-from app.signal_processing.signal_quality import GOOD_BSQI, bsqi
+from app.signal_processing.signal_quality import GOOD_BSQI, LIMIT_BAND, STUCK_S, bsqi
 
 BLOCK_S = 5.0            # judge cleanliness in 5-second blocks
-RAIL_RUN_S = 0.010       # stuck at the very top or bottom for 10 ms or more = artifact
-                         # (R-wave tips touch the top for only 2-6 ms)
+EDGE_PERCENTILE = 0.01   # the signal's top and bottom: the 0.01% most extreme samples are
+                         # ignored, so one corrupted sample can't set them
 NOISE_FACTOR = 3.0       # a block noisier than 3x the typical block = artifact
 SWING_FACTOR = 1.5       # a swing 1.5x taller than a typical R wave = artifact
 MIN_GAP_FRACTION = 0.5   # two "beats" closer than half the typical gap = artifact
-EARLY = 0.80             # a beat arriving before 80% of the usual gap = early
-LONG = 1.20              # a gap over 120% of the usual (not after an early beat) = long
+EARLY = 0.80             # a gap 20% shorter than the one before AND the usual = an early beat
+LONG = 1.20              # a gap 20% longer than the one before AND the usual = a long gap
+USUAL_GAPS = 10          # "the usual gap": the median of the 10 clean gaps around it
 
 
 @dataclass
@@ -46,26 +47,42 @@ class Report:
     sdnn_ms: float | None
     rmssd_ms: float | None
     intervals: BeatIntervals
+    filtered: np.ndarray = field(default=None, repr=False)   # for the whole-ECG view
 
 
 def _rail_runs(x, fs):
-    """Boolean mask of samples stuck at the signal's own top or bottom."""
-    run = max(2, int(RAIL_RUN_S * fs))
-    stuck = (x >= x.max()) | (x <= x.min())
+    """Boolean mask of samples where the signal is stuck at its top or bottom.
+
+    Stuck means within LIMIT_BAND of the signal's own top or bottom for
+    STUCK_S (50 ms) or longer: the amplifier is saturated, because an
+    electrode is lifting or the baseline drifted out of range. A saturated
+    amplifier jitters a few counts below its limit (16,370-16,383 in a
+    real recording), hence the band rather than an exact value.
+
+    R-wave tips that touch the limit for a few milliseconds are not
+    marked: the beat's timing survives clipping (see signal_quality.py).
+    """
+    run = max(2, int(STUCK_S * fs))
+    top = np.percentile(x, 100 - EDGE_PERCENTILE)
+    bottom = np.percentile(x, EDGE_PERCENTILE)
+    band = LIMIT_BAND * (top - bottom)
     mask = np.zeros(len(x), dtype=bool)
-    start = None
-    for i, s in enumerate(np.append(stuck, False)):
-        if s and start is None:
-            start = i
-        elif not s and start is not None:
-            if i - start >= run:
-                mask[start:i] = True
-            start = None
+    for at in (x >= top - band, x <= bottom + band):
+        edges = np.diff(np.concatenate(([0], at.astype(int), [0])))
+        for start, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            if end - start >= run:
+                mask[start:end] = True
     return mask
 
 
-def _clean_blocks(raw, filtered, peaks, check, fs):
-    """Mark each block clean or not: no rail-sticking, normal noise, detectors agree."""
+def _clean_blocks(raw, filtered, peaks, check, fs, gap_rule=True, widen=True):
+    """Mark each block clean or not: no rail-sticking, normal noise, detectors agree.
+
+    gap_rule: also reject a block with two "beats" closer than half the
+    typical gap. widen: also reject the blocks either side of a rejected one.
+    Both suit a still, resting recording; the exercise test turns them off
+    (see app/analysis/exercise_test.py).
+    """
     block = int(BLOCK_S * fs)
     n_blocks = max(1, len(raw) // block)
     rails = _rail_runs(raw, fs)
@@ -80,17 +97,74 @@ def _clean_blocks(raw, filtered, peaks, check, fs):
         a = peaks[(peaks >= lo) & (peaks < hi)]
         c = check[(check >= lo) & (check < hi)]
         agreement = bsqi(a, c, fs)
-        too_close = len(a) > 1 and np.diff(a).min() < MIN_GAP_FRACTION * typical_gap
+        too_close = (gap_rule and len(a) > 1
+                     and np.diff(a).min() < MIN_GAP_FRACTION * typical_gap)
         too_tall = np.abs(filtered[lo:hi]).max() > SWING_FACTOR * typical_r
         if (rails[lo:hi].any() or noise[b] > NOISE_FACTOR * typical_noise
                 or too_close or too_tall
                 or agreement is None or agreement < GOOD_BSQI):
             clean[b] = False
+    if not widen:
+        return clean
     # A block next to an artifact is often disturbed too.
     widened = clean.copy()
     widened[1:] &= clean[:-1]
     widened[:-1] &= clean[1:]
     return widened
+
+
+def _beat_timing(rr, rr_clean):
+    """Sort the clean gaps into: ending in an early beat, unusually long, or normal.
+
+    A beat is early if its gap is at least 20% shorter than BOTH the gap
+    just before it and the usual gap (the median of the 10 clean gaps
+    around it). A gap is long if it is at least 20% longer than both.
+
+    Needing both is what tells an early beat or a pause from breathing.
+    Breathing speeds the heart up and slows it down gradually, a few
+    percent a beat, so each gap stays close to the one before it even
+    when it drifts more than 20% from the usual. The first version
+    compared with the usual gap only, and called ordinary breathing in a
+    healthy young adult (S005, 24 Oct: gaps of 714, 770 and 828 ms) three
+    long gaps. Those gaps were also left out of the variability, which
+    made it read too low: breathing is part of what SDNN and RMSSD measure.
+
+    The gap before may be the pause after an early beat, so in a run of
+    alternating early beats every one is found. A gap whose previous gap
+    isn't clean can't be judged this way, so it is counted as normal. The
+    pause after an early beat is not counted as normal either way.
+
+    Checked on the four MIT-BIH records here against the cardiologists'
+    marks: it found 58 of the 66 premature beats in clean parts (the first
+    version: 60) with half the flags on beats that weren't premature (10,
+    against 20, nearly all in record 203, whose rhythm is irregular
+    throughout), and none of the 8 false flags the first version put on
+    our own six resting recordings.
+
+    Returns (indices of early-beat gaps, indices of long gaps, normal mask).
+    """
+    rr = np.asarray(rr, dtype=float)
+    normal = np.asarray(rr_clean, dtype=bool).copy()
+    idx = np.flatnonzero(rr_clean)
+    good = rr[idx]
+    half = USUAL_GAPS // 2
+    early, long_gaps = [], []
+    for j, i in enumerate(idx):
+        if not normal[i]:
+            continue                                  # the pause after an early beat
+        if i == 0 or not rr_clean[i - 1]:
+            continue                                  # nothing clean to compare with
+        usual = np.median(good[max(0, j - half):j + half + 1])
+        before = rr[i - 1]
+        if rr[i] < EARLY * before and rr[i] < EARLY * usual:
+            early.append(i)
+            normal[i] = False
+            if i + 1 < len(rr):
+                normal[i + 1] = False                 # the pause after an early beat
+        elif rr[i] > LONG * before and rr[i] > LONG * usual:
+            long_gaps.append(i)
+            normal[i] = False
+    return np.array(early, dtype=int), np.array(long_gaps, dtype=int), normal
 
 
 def build_report(raw, fs):
@@ -115,18 +189,9 @@ def build_report(raw, fs):
         heart_rate = 60000.0 / good.mean()
         rolling = np.convolve(good, np.ones(10) / 10, mode="valid")
         hr_range = (60000.0 / rolling.max(), 60000.0 / rolling.min())
-        # Compare each clean gap with the median of the 10 clean gaps around it.
-        idx = np.flatnonzero(rr_clean)
-        for j, i in enumerate(idx):
-            usual = np.median(good[max(0, j - 5):j + 6])
-            if rr[i] < EARLY * usual:
-                early.append(beat_times[i + 1])
-                normal[i] = False
-                if i + 1 < len(rr):
-                    normal[i + 1] = False          # the pause after an early beat
-            elif rr[i] > LONG * usual and normal[i]:
-                long_gaps.append(beat_times[i + 1])
-                normal[i] = False
+        early_i, long_i, normal = _beat_timing(rr, rr_clean)
+        early = beat_times[early_i + 1]
+        long_gaps = beat_times[long_i + 1]
         # Variability uses only gaps between normally-timed beats ("NN").
         nn = rr[normal]
         if len(nn) >= 10:
@@ -155,6 +220,7 @@ def build_report(raw, fs):
         sdnn_ms=sdnn,
         rmssd_ms=rmssd,
         intervals=intervals,
+        filtered=filtered,
     )
 
 

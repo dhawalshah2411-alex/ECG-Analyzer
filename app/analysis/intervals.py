@@ -42,6 +42,7 @@ T_SEARCH_S = (0.04, 0.55)   # T is looked for from 40 ms after QRS end...
 T_RR_FRACTION = 0.65        # ...to 550 ms after R, or 65% of the beat gap if sooner
 T_TANGENT_S = 0.20          # steepest T downslope within 200 ms after its peak
 MIN_T_FRACTION = 0.03       # a T wave under 3% of R's height is too flat to end reliably
+T_END_RR_FRACTION = 0.75    # T must end within 75% of the gap to the next beat
 
 
 @dataclass
@@ -64,10 +65,11 @@ class BeatIntervals:
     fs: float = 0.0
 
 
-def average_beat(x, peaks, fs):
+def average_beat(x, peaks, fs, min_correlation=MIN_CORRELATION):
     """Median of the beats around each R peak, leaving out unusual ones.
 
     x: filtered signal. peaks: R-peak sample positions.
+    min_correlation: how alike a beat must be to the first-pass average.
     Returns (template, r_index, beats_used, median_rr_samples), or
     (None, ...) if too few usable beats.
     """
@@ -90,7 +92,7 @@ def average_beat(x, peaks, fs):
         return None, before, len(beats), typical
 
     first = np.median(beats, axis=0)
-    similar = np.array([np.corrcoef(b, first)[0, 1] for b in beats]) >= MIN_CORRELATION
+    similar = np.array([np.corrcoef(b, first)[0, 1] for b in beats]) >= min_correlation
     beats = beats[similar]
     if len(beats) < MIN_BEATS:
         return None, before, len(beats), typical
@@ -210,7 +212,10 @@ def delineate(template, r, fs, rr_samples):
             # Where the tangent at k reaches the level the signal settles
             # at after T (the TP segment, before the next P wave).
             t_off = k + (end_level - y[k]) / (d[k] / fs)
-            if t_peak < t_off < n:
+            # At fast rates the tangent can reach into the next beat: on a
+            # real exercise test it gave a QT of 468 ms at 112 bpm, over 80%
+            # of the gap between beats. Such an end is not accepted.
+            if t_peak < t_off < min(n, r + T_END_RR_FRACTION * rr_samples):
                 points["t_off"] = int(round(t_off))
 
     def gap(a, b):
@@ -227,9 +232,9 @@ def delineate(template, r, fs, rr_samples):
     return points, values
 
 
-def measure(x, peaks, fs):
+def measure(x, peaks, fs, min_correlation=MIN_CORRELATION):
     """Average the beats in a filtered signal and measure the result."""
-    template, r, used, rr = average_beat(x, peaks, fs)
+    template, r, used, rr = average_beat(x, peaks, fs, min_correlation)
     result = BeatIntervals(n_beats=used, r_index=r, fs=fs)
     if template is None:
         return result

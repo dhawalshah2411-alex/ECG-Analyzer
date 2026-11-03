@@ -4,7 +4,8 @@ Opens by itself when a recording is saved. It shows the average beat
 with every boundary drawn on it, the gap between every pair of beats
 across the whole recording, and a table of measurements, each beside
 its typical adult range. Every number can be checked against the
-picture it came from.
+picture it came from, and "View whole ECG" shows every second of the
+recording as strips of ECG paper.
 
 To preview it on a saved recording without recording again:
 
@@ -18,10 +19,11 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QVBoxLayout, QWidget)
+                               QPushButton, QVBoxLayout, QWidget)
 
 from app.analysis.references import SOURCES, reference
 from app.ui import theme
+from app.ui.ecg_viewer import ECGViewer, recording_folder
 from app.ui.widgets import format_mmss
 
 PAPER = QColor(255, 251, 250)
@@ -51,6 +53,8 @@ class ReportWindow(QWidget):
         self._report = report
         self._units = units
         self._sex = sex
+        self._title, self._details = title, details
+        self._viewer = None
 
         header = self._header(title, details)
         left = QVBoxLayout()
@@ -84,6 +88,8 @@ class ReportWindow(QWidget):
         summary = QLabel(f"{r.beats_total} beats found · {r.clean_fraction:.0%} of the "
                          f"recording clean · average beat built from {r.intervals.n_beats} beats")
         summary.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: 13px;")
+        whole = QPushButton("View whole ECG")
+        whole.clicked.connect(self._show_whole_ecg)
 
         text = QVBoxLayout()
         text.setSpacing(2)
@@ -94,7 +100,17 @@ class ReportWindow(QWidget):
         layout.addLayout(text)
         layout.addStretch()
         layout.addWidget(summary)
+        layout.addSpacing(12)
+        layout.addWidget(whole)
         return bar
+
+    def _show_whole_ecg(self):
+        """Every second of the recording as strips of ECG paper, in its own window."""
+        r = self._report
+        self._viewer = ECGViewer(r.filtered, r.fs, self._title, self._details,
+                                 marks=r.early_times_s, save_dir=recording_folder(self._title))
+        self._viewer.show()
+        self._viewer.raise_()
 
     @staticmethod
     def _section(title, widget):
