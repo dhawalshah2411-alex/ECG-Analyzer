@@ -36,3 +36,16 @@ test_hr.py
 test_record.py
 test_thread.py
 test_window.py
+
+# Noise stress test data: public, 29 MB, so not stored here. Download it with:
+#   py -c "import wfdb; wfdb.dl_database('nstdb', dl_dir='data/nstdb')"
+data/nstdb/
+
+# More local development scripts (not part of the application)
+test_capture.py
+test_dialog.py
+test_pipeline.py
+test_quality.py
+test_stall.py
+test_startup.py
+test_store.py
